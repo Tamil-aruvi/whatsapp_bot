@@ -1,19 +1,18 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import requests
-import os
 from gemini_utils import generate_with_gemini
 from ollama_utils import ask_ollama
 
 app = Flask(__name__)
 
 # === Configuration ===
-VERIFY_TOKEN = "verify token"
-WHATSAPP_TOKEN = "token"
-PHONE_NUMBER_ID = "num"
+VERIFY_TOKEN = "Token"
+WHATSAPP_TOKEN = "whatsapptoken"
+PHONE_NUMBER_ID = "numberid"
 
 # === In-memory session store ===
 session_memory = {}  # user_id -> list of message dicts
-user_models = {}     # user_id -> model choice ("gemini" or "ollama")
+user_models = {}     # user_id -> model choice
 
 @app.route("/", methods=["GET"], endpoint="verify")
 def verify():
@@ -29,46 +28,61 @@ def webhook():
     try:
         entry = data["entry"][0]["changes"][0]["value"]
         if "messages" in entry:
-            phone = entry["messages"][0]["from"]
-            msg = entry["messages"][0]["text"]["body"].strip().lower()
+            message = entry["messages"][0]
+            phone = message["from"]
+            msg_type = message["type"]
 
-            print(f"✅ Message entry found\n📱 From: {phone} | Message: {msg}")
+            # === Button reply handling ===
+            if msg_type == "interactive":
+                reply_id = message["interactive"]["button_reply"]["id"]
 
-            # ✅ Model switch
-            if msg.startswith("/model"):
-                model_choice = msg.split(" ")[-1]
-                if model_choice in ["gemini", "ollama"]:
-                    user_models[phone] = model_choice
-                    send_whatsapp_message(phone, f"✅ Model changed to: {model_choice.capitalize()}")
+                if reply_id == "model_gemini":
+                    user_models[phone] = "gemini"
+                    send_whatsapp_message(phone, "✅ Model set to Gemini. Ask your legal question.")
+                    return "ok", 200
+
+                elif reply_id == "model_ollama":
+                    user_models[phone] = "ollama"
+                    send_whatsapp_message(phone, "✅ Model set to Ollama. Ask your legal question.")
+                    return "ok", 200
+
+                elif reply_id == "reset_memory":
+                    session_memory[phone] = []
+                    send_whatsapp_message(phone, "🧠 Memory reset. Please select a model again.")
+                    send_model_selection_buttons(phone)
+                    return "ok", 200
+
+            # === Text handling ===
+            elif msg_type == "text":
+                msg = message["text"]["body"].strip()
+
+                if phone not in user_models:
+                    send_model_selection_buttons(phone)
+                    return "ok", 200
+
+                # Generate AI response
+                history = session_memory.setdefault(phone, [])
+                history.append({"role": "user", "content": msg})
+                context = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in history[-4:])
+                model_choice = user_models.get(phone, "gemini")
+
+                if model_choice == "gemini":
+                    reply = generate_with_gemini(prompt=msg, context=context)
                 else:
-                    send_whatsapp_message(phone, "❌ Invalid model. Use: /model gemini or /model ollama")
-                return "ok", 200
+                    reply = ask_ollama(msg, context=context)
 
-            # ✅ RESET handling
-            if msg in ["/reset", "reset", "clear"]:
-                session_memory[phone] = []
-                send_whatsapp_message(phone, "🧠 Memory reset. Start a new legal query.")
-                return "ok", 200
+                history.append({"role": "bot", "content": reply})
+                send_whatsapp_message(phone, reply)
 
-            # Normal flow
-            history = session_memory.setdefault(phone, [])
-            history.append({"role": "user", "content": msg})
-            formatted = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in history[-4:])
-
-            model_choice = user_models.get(phone, "gemini")
-            if model_choice == "gemini":
-                reply_text = generate_with_gemini(prompt=msg, context=formatted)
-            else:
-                reply_text = ask_ollama(msg, context=formatted)
-
-            history.append({"role": "bot", "content": reply_text})
-            send_whatsapp_message(phone, reply_text)
+                # After sending response, show options again
+                send_post_response_buttons(phone)
 
     except Exception as e:
         print("❌ Error handling message:", e)
 
     return "ok", 200
 
+# === Send plain text message ===
 def send_whatsapp_message(recipient_id, message_text):
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -81,8 +95,71 @@ def send_whatsapp_message(recipient_id, message_text):
         "type": "text",
         "text": {"body": message_text}
     }
-    r = requests.post(url, headers=headers, json=payload)
-    print("📤 Sent:", r.status_code, r.text)
+    requests.post(url, headers=headers, json=payload)
+
+# === Show initial model selection ===
+def send_model_selection_buttons(recipient_id):
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": "👋 Hello! Choose a model to begin:"},
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {"id": "model_gemini", "title": "Gemini"}
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {"id": "model_ollama", "title": "Ollama"}
+                    }
+                ]
+            }
+        }
+    }
+    requests.post(url, headers=headers, json=payload)
+
+# === Show Gemini, Ollama, Reset options after each response ===
+def send_post_response_buttons(recipient_id):
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": "🔁 Would you like to switch models or reset memory?"},
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {"id": "model_gemini", "title": "Gemini"}
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {"id": "model_ollama", "title": "Ollama"}
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {"id": "reset_memory", "title": "🧠 Reset"}
+                    }
+                ]
+            }
+        }
+    }
+    requests.post(url, headers=headers, json=payload)
 
 if __name__ == "__main__":
     app.run(port=5500)
