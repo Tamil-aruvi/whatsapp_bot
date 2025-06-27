@@ -7,8 +7,8 @@ from ollama_utils import ask_ollama
 app = Flask(__name__)
 
 # === Configuration ===
-VERIFY_TOKEN = "token"
-WHATSAPP_TOKEN = "key"
+VERIFY_TOKEN = "verify token"
+WHATSAPP_TOKEN = "token"
 PHONE_NUMBER_ID = "num"
 
 # === In-memory session store ===
@@ -85,4 +85,4 @@ def send_whatsapp_message(recipient_id, message_text):
     print("📤 Sent:", r.status_code, r.text)
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    app.run(port=5500)
